@@ -1,0 +1,20 @@
+name: Windows PR Build
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile Windows application
+        run: cargo build --release --locked
+      - name: Compile unit tests
+        run: cargo test --no-run --locked
