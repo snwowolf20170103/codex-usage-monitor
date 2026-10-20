@@ -24,5 +24,8 @@ Desktop.ini
 workflow.cmd
 AGENTS.md
 
+# Local AI assistant workspace data
+.workbuddy-ai/
+
 # Local WinGet manifest generation output
 /manifests/
