@@ -3200,7 +3200,7 @@ fn position_at_taskbar() {
             unsafe {
                 let _ = SetWindowPos(
                     hwnd, HWND_TOPMOST, x, y, width, height,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    SWP_NOACTIVATE,
                 );
             }
         }
