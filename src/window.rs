@@ -925,7 +925,38 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         native_interop::unhook_win_event(hook);
     }
 
-    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
+    // Layered child windows may be occluded by Explorer/third-party taskbar
+    // controls in a narrow side-docked taskbar. Use a non-activating, topmost
+    // popup over the side taskbar instead, so WM_PAINT renders normally.
+    // Horizontal taskbars keep their existing embedded window path.
+    let use_popup = is_vertical_taskbar(&taskbar.rect);
+    if use_popup {
+        unsafe {
+            // Important when moving from another taskbar: detach before
+            // restoring popup styles, otherwise parent clipping still applies.
+            let _ = SetParent(hwnd, HWND::default());
+            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+            let popup_style = (style & !WS_CHILD.0) | WS_POPUP.0;
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, popup_style as i32);
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            let popup_ex_style = ex_style
+                | WS_EX_LAYERED.0
+                | WS_EX_TOOLWINDOW.0
+                | WS_EX_NOACTIVATE.0;
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, popup_ex_style as i32);
+            // Opacity-controlled layered popup is painted through WM_PAINT.
+            // Do not call UpdateLayeredWindow for this host mode.
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+            let _ = SetWindowPos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+        diagnose::log("vertical taskbar: using topmost popup (not embedded)");
+    } else {
+        native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
+        diagnose::log("horizontal taskbar: using embedded child");
+    }
 
     let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
     if tray_notify.is_some() {
@@ -950,7 +981,7 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         s.tray_notify_hwnd = tray_notify;
         s.win_event_hook = hook;
         s.taskbar_index = index;
-        s.embedded = true;
+        s.embedded = !use_popup;
     }
     true
 }
@@ -3164,9 +3195,18 @@ fn position_at_taskbar() {
             );
         } else {
             native_interop::move_window(hwnd, x, y, width, height);
+            // Shell reflow can move the tray above a popup. Keep our narrow
+            // quota overlay at the top of its dedicated taskbar slot.
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd, HWND_TOPMOST, x, y, width, height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
         }
         diagnose::log(format!(
-            "positioned vertical taskbar widget x={x} y={y} w={width} h={height}",
+            "positioned vertical taskbar widget host={} x={x} y={y} w={width} h={height}",
+            if embedded { "embedded" } else { "popup" },
         ));
         return;
     }
