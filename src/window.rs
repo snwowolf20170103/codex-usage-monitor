@@ -939,14 +939,14 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
             let popup_style = (style & !WS_CHILD.0) | WS_POPUP.0;
             let _ = SetWindowLongW(hwnd, GWL_STYLE, popup_style as i32);
             let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-            let popup_ex_style = ex_style
-                | WS_EX_LAYERED.0
+            let popup_ex_style = (ex_style & !WS_EX_LAYERED.0)
                 | WS_EX_TOOLWINDOW.0
                 | WS_EX_NOACTIVATE.0;
             let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, popup_ex_style as i32);
-            // Opacity-controlled layered popup is painted through WM_PAINT.
-            // Do not call UpdateLayeredWindow for this host mode.
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+            // A side-docked quota widget has an opaque background. Avoid
+            // layered-window alpha composition entirely: a normal popup
+            // receives WM_PAINT and uses the same GDI double buffering as the
+            // original fallback. This also avoids shell alpha/Z-order quirks.
             let _ = SetWindowPos(
                 hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
@@ -3208,6 +3208,19 @@ fn position_at_taskbar() {
             "positioned vertical taskbar widget host={} x={x} y={y} w={width} h={height}",
             if embedded { "embedded" } else { "popup" },
         ));
+        if diagnose::is_enabled() {
+            unsafe {
+                let mut actual = RECT::default();
+                let rect_ok = GetWindowRect(hwnd, &mut actual).is_ok();
+                let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+                let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+                diagnose::log(format!(
+                    "vertical popup window state: rect_ok={rect_ok} actual=({}, {}, {}, {}) visible={} style=0x{style:08x} ex_style=0x{ex_style:08x}",
+                    actual.left, actual.top, actual.right, actual.bottom,
+                    IsWindowVisible(hwnd).as_bool(),
+                ));
+            }
+        }
         return;
     }
 
@@ -3381,6 +3394,17 @@ unsafe extern "system" fn wnd_proc(
                 let _ = BeginPaint(hwnd, &mut ps);
                 let _ = EndPaint(hwnd, &ps);
             } else {
+                // Log the first opaque popup paint to distinguish a missing
+                // WM_PAINT message from z-order or composition issues.
+                static POPUP_PAINT_LOGGED: AtomicU32 = AtomicU32::new(0);
+                if diagnose::is_enabled() && POPUP_PAINT_LOGGED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    let mut rect = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rect);
+                    diagnose::log(format!(
+                        "popup WM_PAINT received client={}x{}",
+                        rect.right - rect.left, rect.bottom - rect.top,
+                    ));
+                }
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
                 paint(hdc, hwnd);
