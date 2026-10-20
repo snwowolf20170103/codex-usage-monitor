@@ -1626,7 +1626,50 @@ const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
 
+
+const VERTICAL_ROW_PX: i32 = 43;
+const VERTICAL_PROVIDER_HEADER_PX: i32 = 15;
+
+/// Explorer taskbars docked to either side are tall and narrow. Do not rely
+/// on the tray notification area's horizontal coordinates for these taskbars.
+fn is_vertical_taskbar(rect: &RECT) -> bool {
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    width > 0 && height > width.saturating_mul(2)
+}
+
+fn vertical_widget_width(rect: &RECT) -> i32 {
+    ((rect.right - rect.left) - sc(4)).clamp(1, sc(72).max(1))
+}
+
+fn vertical_content_height(providers: i32, rows: i32) -> i32 {
+    let providers = providers.max(1);
+    let rows = rows.max(1);
+    let provider_header = if providers > 1 { VERTICAL_PROVIDER_HEADER_PX } else { 0 };
+    sc(8 + providers * (provider_header + rows * VERTICAL_ROW_PX) + (providers - 1) * 3)
+}
+
+fn vertical_widget_height_for_state(state: &AppState) -> i32 {
+    vertical_content_height(
+        active_model_count(state.show_claude_code, state.show_codex, state.show_antigravity),
+        state.show_session_window as i32 + state.show_weekly_window as i32,
+    )
+}
+
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
+    // A side taskbar uses the full narrow width for content. Disable the
+    // horizontal-only divider drag; normal taskbars keep their existing drag.
+    let vertical = {
+        let state = lock_state();
+        state.as_ref()
+            .and_then(|s| s.taskbar_hwnd)
+            .and_then(native_interop::get_taskbar_rect)
+            .as_ref()
+            .is_some_and(is_vertical_taskbar)
+    };
+    if vertical {
+        return false;
+    }
     let divider_h = sc(25);
     let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
     client_x >= 0
@@ -1779,6 +1822,12 @@ fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: 
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
+    if let Some(rect) = state.taskbar_hwnd
+        .and_then(native_interop::get_taskbar_rect)
+        .filter(is_vertical_taskbar)
+    {
+        return vertical_widget_width(&rect);
+    }
     total_widget_width_for(
         active_model_count(
             state.show_claude_code,
@@ -1791,20 +1840,10 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
 }
 
 fn total_widget_width() -> i32 {
-    let (active_models, language, appearance) = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| {
-                (
-                    active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
-                    s.language,
-                    s.appearance,
-                )
-            })
-            .unwrap_or((1, LanguageId::English, Appearance::default()))
-    };
-    total_widget_width_for(active_models, language, appearance)
+    let state = lock_state();
+    state.as_ref().map(total_widget_width_for_state).unwrap_or_else(|| {
+        total_widget_width_for(1, LanguageId::English, Appearance::default())
+    })
 }
 
 fn claude_accent_color() -> Color {
@@ -2141,6 +2180,10 @@ fn update_quota_tooltips() {
         let state = lock_state();
         let Some(s) = state.as_ref() else { return };
         let mut regions = Vec::new();
+        let vertical_rect = s.taskbar_hwnd
+            .and_then(native_interop::get_taskbar_rect)
+            .filter(is_vertical_taskbar);
+        let mut next_vertical_top = sc(4);
         if !s.dragging {
             let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
@@ -2194,15 +2237,27 @@ fn update_quota_tooltips() {
                         }
                     }
                 }
-                regions.push((
+                let region = if let Some(taskbar_rect) = vertical_rect.as_ref() {
+                    let header = if count > 1 { sc(VERTICAL_PROVIDER_HEADER_PX) } else { 0 };
+                    let row_count = s.show_session_window as i32 + s.show_weekly_window as i32;
+                    let bottom = next_vertical_top + header + sc(row_count * VERTICAL_ROW_PX);
+                    let region = RECT {
+                        left: 0,
+                        top: next_vertical_top,
+                        right: vertical_widget_width(taskbar_rect),
+                        bottom,
+                    };
+                    next_vertical_top = bottom + sc(3);
+                    region
+                } else {
                     RECT {
                         left,
                         top: 0,
                         right: left + width,
                         bottom: sc(WIDGET_HEIGHT),
-                    },
-                    text,
-                ));
+                    }
+                };
+                regions.push((region, text));
                 left += width + sc(MODEL_RIGHT_MARGIN);
             }
         }
@@ -2413,6 +2468,124 @@ fn render_layered() {
     }
 }
 
+
+fn draw_vertical_quota(
+    hdc: HDC,
+    width: i32,
+    top: i32,
+    label: &str,
+    percent: f64,
+    source: &str,
+    accent: &Color,
+    track: &Color,
+    text_color: &Color,
+) {
+    // Values are only valid if the source quota text actually contains a
+    // percentage; missing windows/errors must not look like a full quota.
+    let available = source.contains('%');
+    let display = if available {
+        format!("{percent:.0}%")
+    } else if source.starts_with("--") {
+        "--".to_string()
+    } else {
+        "!".to_string()
+    };
+    unsafe {
+        let centered = |value: &str, top: i32, height: i32, color: &Color| {
+            let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+            let mut wide: Vec<u16> = value.encode_utf16().collect();
+            let mut rect = RECT {
+                left: sc(1),
+                top,
+                right: width - sc(1),
+                bottom: top + height,
+            };
+            let _ = DrawTextW(
+                hdc, &mut wide, &mut rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        };
+        centered(label, top, sc(16), text_color);
+        centered(&display, top + sc(17), sc(18), accent);
+    }
+    let bar = RECT {
+        left: sc(5),
+        top: top + sc(37),
+        right: (width - sc(5)).max(sc(6)),
+        bottom: top + sc(42),
+    };
+    draw_rounded_rect(hdc, &bar, track, sc(2));
+    if available {
+        fill_rounded_bar(hdc, &bar, (percent / 100.0).clamp(0.0, 1.0), accent, sc(2));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_vertical_content(
+    hdc: HDC,
+    width: i32,
+    appearance: Appearance,
+    text_color: &Color,
+    track: &Color,
+    session_pct: f64,
+    session_text: &str,
+    weekly_pct: f64,
+    weekly_text: &str,
+    codex_session_pct: f64,
+    codex_session_text: &str,
+    codex_weekly_pct: f64,
+    codex_weekly_text: &str,
+    antigravity_session_pct: f64,
+    antigravity_session_text: &str,
+    antigravity_weekly_pct: f64,
+    antigravity_weekly_text: &str,
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_session_window: bool,
+    show_weekly_window: bool,
+    claude_accent: &Color,
+    codex_accent: &Color,
+    antigravity_accent: &Color,
+) {
+    unsafe {
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let font = create_widget_font(appearance);
+        let old_font = SelectObject(hdc, font);
+        let providers = active_model_count(show_claude_code, show_codex, show_antigravity);
+        let mut top = sc(4);
+        for (name, enabled, session, session_text, weekly, weekly_text, color) in [
+            ("Claude", show_claude_code, session_pct, session_text, weekly_pct, weekly_text, claude_accent),
+            ("Codex", show_codex, codex_session_pct, codex_session_text, codex_weekly_pct, codex_weekly_text, codex_accent),
+            ("Google", show_antigravity, antigravity_session_pct, antigravity_session_text, antigravity_weekly_pct, antigravity_weekly_text, antigravity_accent),
+        ] {
+            if !enabled {
+                continue;
+            }
+            if providers > 1 {
+                let mut rect = RECT { left: 0, top, right: width, bottom: top + sc(VERTICAL_PROVIDER_HEADER_PX) };
+                let mut wide: Vec<u16> = name.encode_utf16().collect();
+                let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+                let _ = DrawTextW(hdc, &mut wide, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                top += sc(VERTICAL_PROVIDER_HEADER_PX);
+            }
+            if show_session_window {
+                draw_vertical_quota(hdc, width, top, "5h", session, session_text, color, track, text_color);
+                top += sc(VERTICAL_ROW_PX);
+            }
+            if show_weekly_window {
+                draw_vertical_quota(hdc, width, top, "7d", weekly, weekly_text, color, track, text_color);
+                top += sc(VERTICAL_ROW_PX);
+            }
+            if providers > 1 {
+                top += sc(3);
+            }
+        }
+        let _ = SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+    }
+}
+
 /// Paint all widget content onto a DC with a given background color.
 fn paint_content(
     hdc: HDC,
@@ -2466,6 +2639,22 @@ fn paint_content(
         let bg_brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
         FillRect(hdc, &client_rect, bg_brush);
         let _ = DeleteObject(bg_brush);
+
+        // The child window is deliberately narrow only on vertical taskbars.
+        // Preserve the original horizontal drawing path byte-for-byte otherwise.
+        if width <= sc(72) && height > sc(42) {
+            paint_vertical_content(
+                hdc, width, appearance, text_color, track,
+                session_pct, session_text, weekly_pct, weekly_text,
+                codex_session_pct, codex_session_text, codex_weekly_pct, codex_weekly_text,
+                antigravity_session_pct, antigravity_session_text,
+                antigravity_weekly_pct, antigravity_weekly_text,
+                show_claude_code, show_codex, show_antigravity,
+                show_session_window, show_weekly_window,
+                accent, codex_accent, antigravity_accent,
+            );
+            return;
+        }
 
         // Left divider
         let divider_h = sc(25);
@@ -2946,6 +3135,41 @@ fn position_at_taskbar() {
             return;
         }
     };
+
+    // Side-docked taskbars require a narrow, vertically stacked widget.
+    // Anchor it immediately above the tray rather than using tray_left.
+    if is_vertical_taskbar(&taskbar_rect) {
+        let requested_height = {
+            let state = lock_state();
+            state.as_ref().map(vertical_widget_height_for_state).unwrap_or(sc(94))
+        };
+        let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
+        let width = vertical_widget_width(&taskbar_rect);
+        let height = requested_height.min((taskbar_height - sc(8)).max(1));
+        let tray_top = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
+            .and_then(native_interop::get_window_rect_safe)
+            .map(|rect| rect.top)
+            .filter(|top| *top > taskbar_rect.top)
+            .unwrap_or(taskbar_rect.bottom);
+        let top = if tray_top - taskbar_rect.top >= height + sc(8) {
+            tray_top - height - sc(4)
+        } else {
+            taskbar_rect.top + sc(4)
+        };
+        let y = top.clamp(taskbar_rect.top, (taskbar_rect.bottom - height).max(taskbar_rect.top));
+        let x = taskbar_rect.left + (taskbar_rect.right - taskbar_rect.left - width) / 2;
+        if embedded {
+            native_interop::move_window(
+                hwnd, x - taskbar_rect.left, y - taskbar_rect.top, width, height,
+            );
+        } else {
+            native_interop::move_window(hwnd, x, y, width, height);
+        }
+        diagnose::log(format!(
+            "positioned vertical taskbar widget x={x} y={y} w={width} h={height}",
+        ));
+        return;
+    }
 
     let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
     let mut tray_left = taskbar_rect.right;
@@ -4733,6 +4957,23 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_vertical_taskbars_without_misclassifying_horizontal_ones() {
+        let right = RECT { left: 1900, top: 0, right: 1960, bottom: 1080 };
+        let left = RECT { left: 0, top: 0, right: 72, bottom: 1080 };
+        let bottom = RECT { left: 0, top: 1030, right: 1920, bottom: 1080 };
+        assert!(is_vertical_taskbar(&right));
+        assert!(is_vertical_taskbar(&left));
+        assert!(!is_vertical_taskbar(&bottom));
+        assert!(vertical_widget_width(&right) <= 60);
+    }
+
+    #[test]
+    fn compact_height_accounts_for_enabled_quota_rows_and_providers() {
+        assert!(vertical_content_height(1, 2) > vertical_content_height(1, 1));
+        assert!(vertical_content_height(2, 2) > vertical_content_height(1, 2));
+    }
 
     #[test]
     fn unavailable_quota_has_no_bar_fill() {
