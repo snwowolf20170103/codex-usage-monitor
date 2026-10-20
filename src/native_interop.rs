@@ -175,17 +175,23 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
 /// Embed our window as a child of the taskbar
 pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
     unsafe {
-        // Preserve existing extended style, add tool window + no activate
+        // Preserve existing extended style, add tool window + no activate.
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
         // Reset alpha mode used by the startup popup fallback before switching
         // back to UpdateLayeredWindow rendering inside the taskbar.
         if ex_style & WS_EX_LAYERED.0 as i32 != 0 {
             let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_LAYERED.0 as i32));
         }
+        // Embedded rendering goes through UpdateLayeredWindow, which silently
+        // does nothing without WS_EX_LAYERED. A widget that was floated on the
+        // desktop has that bit stripped, so restore it unconditionally.
         let _ = SetWindowLongW(
             hwnd,
             GWL_EXSTYLE,
-            ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
+            ex_style
+                | WS_EX_LAYERED.0 as i32
+                | WS_EX_TOOLWINDOW.0 as i32
+                | WS_EX_NOACTIVATE.0 as i32,
         );
 
         // Change from popup to child
