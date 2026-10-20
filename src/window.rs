@@ -51,6 +51,20 @@ impl SendHwnd {
     }
 }
 
+/// Where the widget lives on screen.
+///
+/// `Taskbar` keeps the historical behaviour: anchored inside (or directly
+/// beside) a taskbar slot and clamped to it. `Free` detaches the widget from
+/// the taskbar entirely so it can sit anywhere on the virtual desktop while
+/// staying topmost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Placement {
+    #[default]
+    Taskbar,
+    Free,
+}
+
 /// Shared application state
 struct AppState {
     hwnd: SendHwnd,
@@ -99,13 +113,30 @@ struct AppState {
     taskbar_index: usize,
     monitor_device: Option<String>,
     tray_offset: i32,
+    vertical_offset: Option<i32>,
     anchor_left: bool,
+    // Free placement: widget floats on the desktop instead of hugging a taskbar.
+    placement: Placement,
+    // Top-left of the floating widget in physical virtual-screen pixels.
+    free_x: i32,
+    free_y: i32,
+    // Keeps the narrow column layout while floating after leaving a side taskbar.
+    free_vertical: bool,
     // True only if Explorer paints over the attempted in-taskbar popup.
     // In that case keep the visible quota column just inside the desktop.
     vertical_outside_taskbar: bool,
     dragging: bool,
+    // Drag moves in two axes (floating widget or a side taskbar) instead of
+    // sliding along a horizontal taskbar.
+    drag_free_2d: bool,
+    // A click that never moves must not re-dock or snap the widget.
+    drag_moved: bool,
     drag_start_mouse_x: i32,
+    drag_start_mouse_y: i32,
     drag_start_client_x: i32,
+    drag_start_client_y: i32,
+    drag_start_window_left: i32,
+    drag_start_window_top: i32,
     drag_start_offset: i32,
 
     widget_visible: bool,
@@ -174,6 +205,17 @@ const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 const TIMER_VERTICAL_VISIBILITY: usize = 7;
+const VERTICAL_VISIBILITY_CHECK_INTERVAL_MS: u32 = 250;
+
+/// Nominal width of the floating quota column. A side taskbar gives us a width
+/// to measure against, but a floating widget has to keep its size across
+/// restarts and taskbar restyles, so it uses a fixed DPI-scaled width instead.
+const FREE_VERTICAL_WIDTH: i32 = 52;
+/// Sentinel meaning "no floating position has been recorded yet".
+const FREE_POS_UNSET: i32 = i32::MIN;
+/// Pointer travel (physical px) before a press counts as a drag rather than a
+/// click, so clicking a floating widget never re-docks it by accident.
+const DRAG_THRESHOLD_PX: i32 = 4;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
 /// recreates the taskbar and wipes our tray-icon registration).
@@ -430,8 +472,18 @@ impl Appearance {
 struct SettingsFile {
     #[serde(default)]
     tray_offset: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vertical_offset: Option<i32>,
     #[serde(default)]
     anchor_left: bool,
+    #[serde(default)]
+    placement: Placement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    free_x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    free_y: Option<i32>,
+    #[serde(default)]
+    free_vertical: bool,
     #[serde(default)]
     taskbar_index: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -468,7 +520,12 @@ impl Default for SettingsFile {
     fn default() -> Self {
         Self {
             tray_offset: 0,
+            vertical_offset: None,
             anchor_left: false,
+            placement: Placement::Taskbar,
+            free_x: None,
+            free_y: None,
+            free_vertical: false,
             taskbar_index: 0,
             monitor_device: None,
             poll_interval_ms: default_poll_interval(),
@@ -599,7 +656,12 @@ fn save_state_settings() {
         let state = lock_state();
         state.as_ref().map(|s| SettingsFile {
             tray_offset: s.tray_offset,
+            vertical_offset: s.vertical_offset,
             anchor_left: s.anchor_left,
+            placement: s.placement,
+            free_x: (s.placement == Placement::Free).then_some(s.free_x),
+            free_y: (s.placement == Placement::Free).then_some(s.free_y),
+            free_vertical: s.free_vertical,
             taskbar_index: s.taskbar_index,
             monitor_device: s.monitor_device.clone(),
             poll_interval_ms: s.poll_interval_ms,
@@ -881,23 +943,37 @@ fn sync_tray_icons(hwnd: HWND) {
 }
 
 fn toggle_widget_visibility(hwnd: HWND) {
-    let new_visible = {
+    let (new_visible, taskbar_hwnd, floating) = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
             s.widget_visible = !s.widget_visible;
-            s.widget_visible
+            (s.widget_visible, s.taskbar_hwnd, s.placement == Placement::Free)
         } else {
             return;
         }
     };
+    let vertical_taskbar = taskbar_hwnd
+        .and_then(native_interop::get_taskbar_rect)
+        .as_ref()
+        .is_some_and(is_vertical_taskbar);
     save_state_settings();
     unsafe {
         if new_visible {
-            position_at_taskbar();
+            reposition_widget();
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             render_layered();
-            unsafe { SetTimer(hwnd, TIMER_VERTICAL_VISIBILITY, 750, None); }
+            if vertical_taskbar && !floating {
+                SetTimer(
+                    hwnd,
+                    TIMER_VERTICAL_VISIBILITY,
+                    VERTICAL_VISIBILITY_CHECK_INTERVAL_MS,
+                    None,
+                );
+            } else {
+                let _ = KillTimer(hwnd, TIMER_VERTICAL_VISIBILITY);
+            }
         } else {
+            let _ = KillTimer(hwnd, TIMER_VERTICAL_VISIBILITY);
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
@@ -936,27 +1012,9 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
     // Horizontal taskbars keep their existing embedded window path.
     let use_popup = is_vertical_taskbar(&taskbar.rect);
     if use_popup {
-        unsafe {
-            // Important when moving from another taskbar: detach before
-            // restoring popup styles, otherwise parent clipping still applies.
-            let _ = SetParent(hwnd, HWND::default());
-            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-            let popup_style = (style & !WS_CHILD.0) | WS_POPUP.0;
-            let _ = SetWindowLongW(hwnd, GWL_STYLE, popup_style as i32);
-            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-            let popup_ex_style = (ex_style & !WS_EX_LAYERED.0)
-                | WS_EX_TOOLWINDOW.0
-                | WS_EX_NOACTIVATE.0;
-            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, popup_ex_style as i32);
-            // A side-docked quota widget has an opaque background. Avoid
-            // layered-window alpha composition entirely: a normal popup
-            // receives WM_PAINT and uses the same GDI double buffering as the
-            // original fallback. This also avoids shell alpha/Z-order quirks.
-            let _ = SetWindowPos(
-                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            );
-        }
+        // Important when moving from another taskbar: detach before restoring
+        // popup styles, otherwise parent clipping still applies.
+        make_topmost_popup(hwnd);
         diagnose::log("vertical taskbar: using topmost popup (not embedded)");
     } else {
         native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
@@ -980,17 +1038,33 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         diagnose::log("tray event hook could not be installed");
     }
 
-    let mut state = lock_state();
-    if let Some(s) = state.as_mut() {
-        s.taskbar_hwnd = Some(taskbar.hwnd);
-        s.tray_notify_hwnd = tray_notify;
-        s.win_event_hook = hook;
-        s.taskbar_index = index;
-        s.embedded = !use_popup;
-        s.vertical_outside_taskbar = false;
-    }
-    if use_popup {
-        unsafe { SetTimer(hwnd, TIMER_VERTICAL_VISIBILITY, 750, None); }
+    let widget_visible = {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.taskbar_hwnd = Some(taskbar.hwnd);
+            s.tray_notify_hwnd = tray_notify;
+            s.win_event_hook = hook;
+            s.taskbar_index = index;
+            s.embedded = !use_popup;
+            s.vertical_outside_taskbar = false;
+            s.widget_visible
+        } else {
+            false
+        }
+    };
+    if use_popup && widget_visible {
+        unsafe {
+            SetTimer(
+                hwnd,
+                TIMER_VERTICAL_VISIBILITY,
+                VERTICAL_VISIBILITY_CHECK_INTERVAL_MS,
+                None,
+            );
+        }
+    } else {
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_VERTICAL_VISIBILITY);
+        }
     }
     true
 }
@@ -1024,6 +1098,11 @@ fn refresh_taskbar_selection(hwnd: HWND) {
     let (preferred, legacy_index, current) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else { return };
+        // A floating widget is not attached to any taskbar; re-attaching here
+        // would yank it back on every resolution change.
+        if s.placement == Placement::Free {
+            return;
+        }
         (s.monitor_device.clone(), s.taskbar_index, s.taskbar_hwnd)
     };
     let index = preferred_taskbar_index(&taskbars, preferred.as_deref(), legacy_index);
@@ -1056,7 +1135,8 @@ fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
 
 fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
     let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let max_offset = (tray_left - taskbar_rect.left - total_widget_width()).max(0);
+    let max_offset =
+        (tray_left - taskbar_rect.left - total_widget_width_for_taskbar(&taskbar_rect)).max(0);
     offset.clamp(0, max_offset)
 }
 
@@ -1068,7 +1148,8 @@ fn offset_for_drop_point(
 ) -> i32 {
     let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
     let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
-    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
+    let widget_width = total_widget_width_for_taskbar(&taskbar_rect);
+    let offset = tray_left - taskbar_rect.left - widget_width - desired_left;
     clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
 }
 
@@ -1666,7 +1747,6 @@ const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
 
-
 const VERTICAL_ROW_PX: i32 = 43;
 const VERTICAL_PROVIDER_HEADER_PX: i32 = 15;
 
@@ -1691,24 +1771,30 @@ fn vertical_content_height(providers: i32, rows: i32) -> i32 {
 
 fn vertical_widget_height_for_state(state: &AppState) -> i32 {
     vertical_content_height(
-        active_model_count(state.show_claude_code, state.show_codex, state.show_antigravity),
+        active_model_count(
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity,
+        ),
         state.show_session_window as i32 + state.show_weekly_window as i32,
     )
 }
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
-    // A side taskbar uses the full narrow width for content. Disable the
-    // horizontal-only divider drag; normal taskbars keep their existing drag.
-    let vertical = {
+    // A floating widget and the compact side-taskbar column are both fully
+    // draggable; only the wide horizontal bar keeps a small grip.
+    let full_surface = {
         let state = lock_state();
-        state.as_ref()
-            .and_then(|s| s.taskbar_hwnd)
-            .and_then(native_interop::get_taskbar_rect)
-            .as_ref()
-            .is_some_and(is_vertical_taskbar)
+        state.as_ref().is_some_and(|s| {
+            s.placement == Placement::Free
+                || s.taskbar_hwnd
+                    .and_then(native_interop::get_taskbar_rect)
+                    .as_ref()
+                    .is_some_and(is_vertical_taskbar)
+        })
     };
-    if vertical {
-        return false;
+    if full_surface {
+        return client_x >= 0 && client_y >= 0;
     }
     let divider_h = sc(25);
     let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
@@ -1879,11 +1965,29 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
     )
 }
 
+fn total_widget_width_for_taskbar(taskbar_rect: &RECT) -> i32 {
+    if is_vertical_taskbar(taskbar_rect) {
+        return vertical_widget_width(taskbar_rect);
+    }
+    let state = lock_state();
+    state
+        .as_ref()
+        .map(|s| {
+            total_widget_width_for(
+                active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                s.language,
+                s.appearance,
+            )
+        })
+        .unwrap_or_else(|| total_widget_width_for(1, LanguageId::English, Appearance::default()))
+}
+
 fn total_widget_width() -> i32 {
     let state = lock_state();
-    state.as_ref().map(total_widget_width_for_state).unwrap_or_else(|| {
-        total_widget_width_for(1, LanguageId::English, Appearance::default())
-    })
+    state
+        .as_ref()
+        .map(total_widget_width_for_state)
+        .unwrap_or_else(|| total_widget_width_for(1, LanguageId::English, Appearance::default()))
 }
 
 fn claude_accent_color() -> Color {
@@ -2118,32 +2222,50 @@ pub fn run() {
                 taskbar_index: settings.taskbar_index,
                 monitor_device: settings.monitor_device.clone(),
                 tray_offset: settings.tray_offset,
+                vertical_offset: settings.vertical_offset,
                 anchor_left: settings.anchor_left,
+                placement: settings.placement,
+                free_x: settings.free_x.unwrap_or(i32::MIN),
+                free_y: settings.free_y.unwrap_or(i32::MIN),
+                free_vertical: settings.free_vertical,
                 vertical_outside_taskbar: false,
                 dragging: false,
+                drag_free_2d: false,
+                drag_moved: false,
                 drag_start_mouse_x: 0,
+                drag_start_mouse_y: 0,
                 drag_start_client_x: 0,
+                drag_start_client_y: 0,
+                drag_start_window_left: 0,
+                drag_start_window_top: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
             });
         }
 
-        // Try to embed in taskbar
-        let taskbars = native_interop::find_taskbars();
-        let selected_index = preferred_taskbar_index(
-            &taskbars,
-            settings.monitor_device.as_deref(),
-            settings.taskbar_index,
-        );
-        if attach_to_taskbar(hwnd, selected_index) {
-            embedded = true;
+        // A floating widget deliberately ignores the taskbar: no embedding, no
+        // tray hook, no taskbar-relative repositioning.
+        if settings.placement == Placement::Free {
+            make_topmost_popup(hwnd);
+            diagnose::log("startup: restoring floating placement");
         } else {
-            // During login Explorer may create its taskbar after this app starts.
-            SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None);
+            // Try to embed in taskbar
+            let taskbars = native_interop::find_taskbars();
+            let selected_index = preferred_taskbar_index(
+                &taskbars,
+                settings.monitor_device.as_deref(),
+                settings.taskbar_index,
+            );
+            if attach_to_taskbar(hwnd, selected_index) {
+                embedded = true;
+            } else {
+                // During login Explorer may create its taskbar after this app starts.
+                SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None);
+            }
         }
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
-        if !embedded {
+        if !embedded && settings.placement != Placement::Free {
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
             let _ = SetWindowPos(
                 hwnd,
@@ -2160,13 +2282,18 @@ pub fn run() {
         sync_tray_icons(hwnd);
 
         // Position and show (only if widget_visible preference is true)
-        position_at_taskbar();
+        reposition_widget();
         if settings.widget_visible {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         diagnose::log("window shown");
-        if settings.widget_visible && !embedded {
-            SetTimer(hwnd, TIMER_VERTICAL_VISIBILITY, 750, None);
+        if settings.widget_visible && !embedded && settings.placement != Placement::Free {
+            SetTimer(
+                hwnd,
+                TIMER_VERTICAL_VISIBILITY,
+                VERTICAL_VISIBILITY_CHECK_INTERVAL_MS,
+                None,
+            );
         }
 
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
@@ -2512,7 +2639,6 @@ fn render_layered() {
     }
 }
 
-
 fn draw_vertical_quota(
     hdc: HDC,
     width: i32,
@@ -2599,26 +2725,80 @@ fn paint_vertical_content(
         let providers = active_model_count(show_claude_code, show_codex, show_antigravity);
         let mut top = sc(4);
         for (name, enabled, session, session_text, weekly, weekly_text, color) in [
-            ("Claude", show_claude_code, session_pct, session_text, weekly_pct, weekly_text, claude_accent),
-            ("Codex", show_codex, codex_session_pct, codex_session_text, codex_weekly_pct, codex_weekly_text, codex_accent),
-            ("Google", show_antigravity, antigravity_session_pct, antigravity_session_text, antigravity_weekly_pct, antigravity_weekly_text, antigravity_accent),
+            (
+                "Claude",
+                show_claude_code,
+                session_pct,
+                session_text,
+                weekly_pct,
+                weekly_text,
+                claude_accent,
+            ),
+            (
+                "Codex",
+                show_codex,
+                codex_session_pct,
+                codex_session_text,
+                codex_weekly_pct,
+                codex_weekly_text,
+                codex_accent,
+            ),
+            (
+                "Google",
+                show_antigravity,
+                antigravity_session_pct,
+                antigravity_session_text,
+                antigravity_weekly_pct,
+                antigravity_weekly_text,
+                antigravity_accent,
+            ),
         ] {
             if !enabled {
                 continue;
             }
             if providers > 1 {
-                let mut rect = RECT { left: 0, top, right: width, bottom: top + sc(VERTICAL_PROVIDER_HEADER_PX) };
+                let mut rect = RECT {
+                    left: 0,
+                    top,
+                    right: width,
+                    bottom: top + sc(VERTICAL_PROVIDER_HEADER_PX),
+                };
                 let mut wide: Vec<u16> = name.encode_utf16().collect();
                 let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
-                let _ = DrawTextW(hdc, &mut wide, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                let _ = DrawTextW(
+                    hdc,
+                    &mut wide,
+                    &mut rect,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
                 top += sc(VERTICAL_PROVIDER_HEADER_PX);
             }
             if show_session_window {
-                draw_vertical_quota(hdc, width, top, "5h", session, session_text, color, track, text_color);
+                draw_vertical_quota(
+                    hdc,
+                    width,
+                    top,
+                    "5h",
+                    session,
+                    session_text,
+                    color,
+                    track,
+                    text_color,
+                );
                 top += sc(VERTICAL_ROW_PX);
             }
             if show_weekly_window {
-                draw_vertical_quota(hdc, width, top, "7d", weekly, weekly_text, color, track, text_color);
+                draw_vertical_quota(
+                    hdc,
+                    width,
+                    top,
+                    "7d",
+                    weekly,
+                    weekly_text,
+                    color,
+                    track,
+                    text_color,
+                );
                 top += sc(VERTICAL_ROW_PX);
             }
             if providers > 1 {
@@ -3164,22 +3344,84 @@ fn adjacent_vertical_x(taskbar: &RECT, widget_width: i32) -> i32 {
     }
 }
 
-/// Native side taskbars can occupy a higher shell surface than our topmost
-/// popup, even though IsWindowVisible is true and WM_PAINT is received.
-/// Check actual hit-testing after ShowWindow; if the shell is above us, move
-/// the quota column to the neighboring desktop edge where it is visible.
+/// Find a visible top-level window above the popup that covers the selected
+/// taskbar. Third-party translucent taskbar layers can paint over the popup
+/// while being click-through, so WindowFromPoint alone cannot detect them.
+fn taskbar_cover_above_widget(hwnd: HWND, taskbar_hwnd: HWND, taskbar_rect: &RECT) -> Option<HWND> {
+    unsafe {
+        let mut above = GetWindow(hwnd, GW_HWNDPREV).unwrap_or_default();
+        for _ in 0..64 {
+            if above == HWND::default() {
+                break;
+            }
+            if IsWindowVisible(above).as_bool() {
+                let mut rect = RECT::default();
+                if GetWindowRect(above, &mut rect).is_ok()
+                    && (above == taskbar_hwnd
+                        || (rect.left <= taskbar_rect.left
+                            && rect.top <= taskbar_rect.top
+                            && rect.right >= taskbar_rect.right
+                            && rect.bottom >= taskbar_rect.bottom))
+                {
+                    return Some(above);
+                }
+            }
+            above = GetWindow(above, GW_HWNDPREV).unwrap_or_default();
+        }
+    }
+    None
+}
+
+/// Keep a visible vertical popup above taskbar-sized shell layers. Those
+/// layers can be raised again when the user clicks the taskbar.
 fn ensure_vertical_widget_visible() {
-    let (hwnd, taskbar_hwnd, already_outside, show) = {
+    let (hwnd, taskbar_hwnd, already_outside, show, dragging, floating) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else { return };
-        (s.hwnd.to_hwnd(), s.taskbar_hwnd, s.vertical_outside_taskbar, s.widget_visible)
+        (
+            s.hwnd.to_hwnd(),
+            s.taskbar_hwnd,
+            s.vertical_outside_taskbar,
+            s.widget_visible,
+            s.dragging,
+            s.placement == Placement::Free,
+        )
     };
-    if !show || already_outside { return; }
-    let Some(rect) = taskbar_hwnd
-        .and_then(native_interop::get_taskbar_rect)
-        .filter(is_vertical_taskbar) else { return };
+    if !show || already_outside || dragging {
+        return;
+    }
+    // A floating widget owns its own position and never has to chase a taskbar
+    // overlay: it is topmost by construction and re-raises itself when clicked.
+    if floating {
+        return;
+    }
+    let Some(taskbar_hwnd) = taskbar_hwnd else {
+        return;
+    };
+    let Some(rect) = native_interop::get_taskbar_rect(taskbar_hwnd).filter(is_vertical_taskbar)
+    else {
+        return;
+    };
     unsafe {
-        if !IsWindowVisible(hwnd).as_bool() { return; }
+        if !IsWindowVisible(hwnd).as_bool() {
+            return;
+        }
+        if let Some(cover) = taskbar_cover_above_widget(hwnd, taskbar_hwnd, &rect) {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            diagnose::log(format!(
+                "vertical taskbar overlay {:?} was above widget; restored widget z-order",
+                cover,
+            ));
+            return;
+        }
         let mut actual = RECT::default();
         if GetWindowRect(hwnd, &mut actual).is_err() { return; }
         let center = POINT {
@@ -3187,11 +3429,9 @@ fn ensure_vertical_widget_visible() {
             y: actual.top + (actual.bottom - actual.top) / 2,
         };
         let top_window = WindowFromPoint(center);
-        diagnose::log(format!(
-            "vertical visibility check: self={:?} top={:?} center=({}, {})",
-            hwnd, top_window, center.x, center.y,
-        ));
-        if top_window == hwnd { return; }
+        if top_window == hwnd {
+            return;
+        }
         {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
@@ -3205,6 +3445,212 @@ fn ensure_vertical_widget_visible() {
     }
     position_at_taskbar();
     render_layered();
+}
+
+/// Detach the widget from any taskbar parent and turn it into an opaque,
+/// non-activating, always-on-top popup that can live anywhere on the desktop.
+///
+/// The opaque (non-layered) style is deliberate: it is the same render path the
+/// side-taskbar popup already uses, so a floating widget inherits a proven
+/// WM_PAINT + GDI double-buffer path instead of layered alpha composition.
+fn make_topmost_popup(hwnd: HWND) {
+    unsafe {
+        // Detach first: parent clipping still applies while still a child.
+        let _ = SetParent(hwnd, HWND::default());
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let popup_style = (style & !WS_CHILD.0) | WS_POPUP.0;
+        let _ = SetWindowLongW(hwnd, GWL_STYLE, popup_style as i32);
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let popup_ex_style =
+            (ex_style & !WS_EX_LAYERED.0) | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0;
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, popup_ex_style as i32);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// Size a floating widget keeps for the current layout, DPI and appearance.
+fn free_widget_size(state: &AppState) -> (i32, i32) {
+    if state.free_vertical {
+        (
+            sc(FREE_VERTICAL_WIDTH).clamp(1, sc(72).max(1)),
+            vertical_widget_height_for_state(state),
+        )
+    } else {
+        (
+            total_widget_width_for(
+                active_model_count(
+                    state.show_claude_code,
+                    state.show_codex,
+                    state.show_antigravity,
+                ),
+                state.language,
+                state.appearance,
+            ),
+            sc(WIDGET_HEIGHT),
+        )
+    }
+}
+
+/// Keep a rectangle inside a work area, pinning to the top-left corner when the
+/// widget is larger than the area.
+fn clamp_into_rect(work: RECT, x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
+    let max_x = (work.right - width).max(work.left);
+    let max_y = (work.bottom - height).max(work.top);
+    (x.clamp(work.left, max_x), y.clamp(work.top, max_y))
+}
+
+/// Pull a floating position back into the work area of whichever monitor it is
+/// nearest, so the widget can never be dropped somewhere unreachable.
+fn clamp_free_position(x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
+    unsafe {
+        let probe = POINT {
+            x: x.saturating_add(width / 2),
+            y: y.saturating_add(height / 2),
+        };
+        let monitor = MonitorFromPoint(probe, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() {
+            return (x, y);
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return (x, y);
+        }
+        clamp_into_rect(info.rcWork, x, y, width, height)
+    }
+}
+
+/// First-run floating spot: top-right of the primary work area.
+fn default_free_position(width: i32, height: i32) -> (i32, i32) {
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if monitor.is_invalid() || !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return (sc(40), sc(40));
+        }
+        let work = info.rcWork;
+        (
+            (work.right - width - sc(16)).max(work.left),
+            (work.top + sc(16)).min((work.bottom - height).max(work.top)),
+        )
+    }
+}
+
+/// Place the floating widget from its stored position, resizing it for the
+/// current layout and DPI. Always re-asserts topmost so it stays above
+/// ordinary windows after the user clicks elsewhere.
+fn position_free() {
+    refresh_dpi();
+    let (hwnd, x, y, width, height) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return };
+        let (width, height) = free_widget_size(s);
+        let (raw_x, raw_y) = if s.free_x == FREE_POS_UNSET || s.free_y == FREE_POS_UNSET {
+            default_free_position(width, height)
+        } else {
+            (s.free_x, s.free_y)
+        };
+        let (x, y) = clamp_free_position(raw_x, raw_y, width, height);
+        (s.hwnd.to_hwnd(), x, y, width, height)
+    };
+    unsafe {
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
+    }
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.free_x = x;
+            s.free_y = y;
+        }
+    }
+}
+
+/// Reposition the widget according to its current placement.
+fn reposition_widget() {
+    let free = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .is_some_and(|s| s.placement == Placement::Free)
+    };
+    if free {
+        position_free();
+    } else {
+        position_at_taskbar();
+    }
+}
+
+/// Detach the widget from the taskbar and leave it where the user dropped it.
+fn enter_free_mode(hwnd: HWND, x: i32, y: i32) {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut rect);
+    }
+    let width = (rect.right - rect.left).max(1);
+    let height = (rect.bottom - rect.top).max(1);
+    // Keep the narrow column layout when the widget came off a side taskbar.
+    let vertical = height > width;
+    let (x, y) = clamp_free_position(x, y, width, height);
+
+    make_topmost_popup(hwnd);
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.placement = Placement::Free;
+            s.embedded = false;
+            s.free_vertical = vertical;
+            s.free_x = x;
+            s.free_y = y;
+            s.vertical_outside_taskbar = false;
+        }
+    }
+    unsafe {
+        // The taskbar-overlay watchdog only applies to taskbar-hosted widgets.
+        let _ = KillTimer(hwnd, TIMER_VERTICAL_VISIBILITY);
+    }
+    position_free();
+    render_layered();
+    diagnose::log(format!(
+        "widget detached from taskbar: x={x} y={y} vertical={vertical}"
+    ));
+}
+
+/// Return the widget to its taskbar slot (the "reset position" action).
+fn leave_free_mode(hwnd: HWND) {
+    let index = {
+        let state = lock_state();
+        state.as_ref().map(|s| s.taskbar_index).unwrap_or(0)
+    };
+    if !attach_to_taskbar(hwnd, index) {
+        // No taskbar to dock into right now: keep floating rather than vanish.
+        diagnose::log("reset position: no taskbar available, staying floating");
+        position_free();
+        return;
+    }
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.placement = Placement::Taskbar;
+            s.free_x = FREE_POS_UNSET;
+            s.free_y = FREE_POS_UNSET;
+        }
+    }
+    position_at_taskbar();
+    render_layered();
+    diagnose::log("widget re-attached to taskbar by reset position");
 }
 
 fn position_at_taskbar() {
@@ -3251,9 +3697,12 @@ fn position_at_taskbar() {
     // Side-docked taskbars require a narrow, vertically stacked widget.
     // Anchor it immediately above the tray rather than using tray_left.
     if is_vertical_taskbar(&taskbar_rect) {
-        let requested_height = {
+        let (requested_height, vertical_offset) = {
             let state = lock_state();
-            state.as_ref().map(vertical_widget_height_for_state).unwrap_or(sc(94))
+            state
+                .as_ref()
+                .map(|s| (vertical_widget_height_for_state(s), s.vertical_offset))
+                .unwrap_or((sc(94), None))
         };
         let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
         let width = vertical_widget_width(&taskbar_rect);
@@ -3263,12 +3712,18 @@ fn position_at_taskbar() {
             .map(|rect| rect.top)
             .filter(|top| *top > taskbar_rect.top)
             .unwrap_or(taskbar_rect.bottom);
-        let top = if tray_top - taskbar_rect.top >= height + sc(8) {
+        let default_top = if tray_top - taskbar_rect.top >= height + sc(8) {
             tray_top - height - sc(4)
         } else {
             taskbar_rect.top + sc(4)
         };
-        let y = top.clamp(taskbar_rect.top, (taskbar_rect.bottom - height).max(taskbar_rect.top));
+        let top = vertical_offset
+            .map(|offset| taskbar_rect.top.saturating_add(offset))
+            .unwrap_or(default_top);
+        let y = top.clamp(
+            taskbar_rect.top,
+            (taskbar_rect.bottom - height).max(taskbar_rect.top),
+        );
         let outside = {
             let state = lock_state();
             state.as_ref().is_some_and(|s| s.vertical_outside_taskbar)
@@ -3287,10 +3742,7 @@ fn position_at_taskbar() {
             // Shell reflow can move the tray above a popup. Keep our narrow
             // quota overlay at the top of its dedicated taskbar slot.
             unsafe {
-                let _ = SetWindowPos(
-                    hwnd, HWND_TOPMOST, x, y, width, height,
-                    SWP_NOACTIVATE,
-                );
+                let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
             }
         }
         diagnose::log(format!(
@@ -3420,6 +3872,13 @@ unsafe extern "system" fn on_tray_location_changed(
         if tray_reposition_is_suppressed() {
             return;
         }
+        // Floating widgets do not track the tray.
+        if lock_state()
+            .as_ref()
+            .is_some_and(|s| s.placement == Placement::Free)
+        {
+            return;
+        }
 
         let should_reposition = {
             let mut last = LAST_REPOSITION.lock().unwrap_or_else(|e| e.into_inner());
@@ -3526,7 +3985,7 @@ unsafe extern "system" fn wnd_proc(
             if msg == WM_DISPLAYCHANGE {
                 refresh_taskbar_selection(hwnd);
             }
-            position_at_taskbar();
+            reposition_widget();
             render_layered();
             LRESULT(0)
         }
@@ -3542,22 +4001,26 @@ unsafe extern "system" fn wnd_proc(
                     schedule_countdown_timer();
                 }
                 TIMER_VERTICAL_VISIBILITY => {
-                    let _ = KillTimer(hwnd, TIMER_VERTICAL_VISIBILITY);
                     ensure_vertical_widget_visible();
                 }
                 TIMER_TASKBAR_RETRY => {
                     let attachment = {
                         let state = lock_state();
-                        state.as_ref().map(|s| (s.embedded, s.taskbar_index))
+                        state
+                            .as_ref()
+                            .map(|s| (s.embedded, s.taskbar_index, s.placement))
                     };
                     match attachment {
-                        Some((true, _)) | None => {
+                        Some((true, _, _)) | None => {
                             let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
                         }
-                        Some((false, index)) => {
+                        Some((false, _, Placement::Free)) => {
+                            let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
+                        }
+                        Some((false, index, Placement::Taskbar)) => {
                             if attach_to_taskbar(hwnd, index) {
                                 let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
-                                position_at_taskbar();
+                                reposition_widget();
                                 render_layered();
                                 diagnose::log("taskbar attached after startup retry");
                             }
@@ -3591,17 +4054,33 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_SETCURSOR => {
-            let is_dragging = {
+            let (is_dragging, vertical) = {
                 let state = lock_state();
-                state.as_ref().map(|s| s.dragging).unwrap_or(false)
+                state
+                    .as_ref()
+                    .map(|s| (s.dragging, s.drag_free_2d))
+                    .unwrap_or((false, false))
             };
             if is_dragging {
-                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
+                let cursor_id = if vertical { IDC_SIZEALL } else { IDC_SIZEWE };
+                let cursor = LoadCursorW(HINSTANCE::default(), cursor_id).unwrap_or_default();
                 SetCursor(cursor);
                 return LRESULT(1);
             }
             if cursor_is_on_drag_handle(hwnd) {
-                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
+                let free_2d = {
+                    let state = lock_state();
+                    state.as_ref().is_some_and(|s| {
+                        s.placement == Placement::Free
+                            || (!s.embedded
+                                && s.taskbar_hwnd
+                                    .and_then(native_interop::get_taskbar_rect)
+                                    .as_ref()
+                                    .is_some_and(is_vertical_taskbar))
+                    })
+                };
+                let cursor_id = if free_2d { IDC_SIZEALL } else { IDC_SIZEWE };
+                let cursor = LoadCursorW(HINSTANCE::default(), cursor_id).unwrap_or_default();
                 SetCursor(cursor);
                 return LRESULT(1);
             }
@@ -3616,24 +4095,101 @@ unsafe extern "system" fn wnd_proc(
 
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
+            let mut window_rect = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut window_rect);
+            let mut floating = false;
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
-                if s.anchor_left {
+                // anchor_left pins the widget to the taskbar's left edge; it
+                // has no meaning once the widget floats free.
+                if s.anchor_left && s.placement != Placement::Free {
                     return LRESULT(0);
                 }
+                floating = s.placement == Placement::Free;
                 s.dragging = true;
+                s.drag_moved = false;
+                s.drag_free_2d = floating
+                    || (!s.embedded
+                        && s.taskbar_hwnd
+                            .and_then(native_interop::get_taskbar_rect)
+                            .as_ref()
+                            .is_some_and(is_vertical_taskbar));
                 s.drag_start_mouse_x = pt.x;
+                s.drag_start_mouse_y = pt.y;
                 s.drag_start_client_x = client_x;
+                s.drag_start_client_y = client_y;
+                s.drag_start_window_left = window_rect.left;
+                s.drag_start_window_top = window_rect.top;
                 s.drag_start_offset = s.tray_offset;
+            }
+            drop(state);
+            if floating {
+                // Raise above any other always-on-top window on every press:
+                // that is the most a NOACTIVATE topmost popup can do.
+                unsafe {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
             }
             SetCapture(hwnd);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let is_dragging = {
+            let drag_state = {
                 let state = lock_state();
-                state.as_ref().map(|s| s.dragging).unwrap_or(false)
+                state.as_ref().map(|s| {
+                    (
+                        s.dragging,
+                        s.drag_free_2d,
+                        s.placement,
+                        s.drag_start_mouse_x,
+                        s.drag_start_mouse_y,
+                        s.drag_start_window_left,
+                        s.drag_start_window_top,
+                    )
+                })
             };
+            if let Some((
+                true,
+                true,
+                placement,
+                start_x,
+                start_y,
+                window_x,
+                window_y,
+            )) = drag_state
+            {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let x = window_x + pt.x - start_x;
+                let y = window_y + pt.y - start_y;
+                {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        if (pt.x - start_x).abs() > DRAG_THRESHOLD_PX
+                            || (pt.y - start_y).abs() > DRAG_THRESHOLD_PX
+                        {
+                            s.drag_moved = true;
+                        }
+                        // Track the live position so a drop (and the next
+                        // restart) uses exactly where the widget is now.
+                        if placement == Placement::Free {
+                            s.free_x = x;
+                            s.free_y = y;
+                        }
+                    }
+                }
+                let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+                return LRESULT(0);
+            }
+            let is_dragging = drag_state.is_some_and(|state| state.0);
             if is_dragging {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
@@ -3643,6 +4199,9 @@ unsafe extern "system" fn wnd_proc(
                         Some(s) => s,
                         None => return LRESULT(0),
                     };
+                    if (pt.x - s.drag_start_mouse_x).abs() > DRAG_THRESHOLD_PX {
+                        s.drag_moved = true;
+                    }
 
                     // Moving mouse left = positive delta = larger offset (further left)
                     let delta = s.drag_start_mouse_x - pt.x;
@@ -3733,7 +4292,16 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(s) = state.as_mut() {
                     if s.dragging {
                         s.dragging = false;
-                        Some((s.taskbar_index, s.drag_start_client_x))
+                        let result = Some((
+                            s.taskbar_index,
+                            s.drag_start_client_x,
+                            s.drag_start_client_y,
+                            s.drag_free_2d,
+                            s.drag_moved,
+                            s.placement,
+                        ));
+                        s.drag_free_2d = false;
+                        result
                     } else {
                         None
                     }
@@ -3741,20 +4309,63 @@ unsafe extern "system" fn wnd_proc(
                     None
                 }
             };
-            if let Some((current_taskbar_index, drag_start_client_x)) = drag_result {
+            if let Some((
+                current_taskbar_index,
+                drag_start_client_x,
+                drag_start_client_y,
+                source_was_free_2d,
+                drag_moved,
+                source_placement,
+            )) = drag_result
+            {
                 let _ = ReleaseCapture();
+                // A press that never travelled is a click, not a drag. Doing
+                // nothing here is what stops clicks from re-docking a floating
+                // widget or snapping a docked one back into its slot.
+                if !drag_moved {
+                    return LRESULT(0);
+                }
                 if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
-                    if target_index != current_taskbar_index {
-                        let new_offset = offset_for_drop_point(
-                            target_taskbar.hwnd,
-                            target_taskbar.rect,
-                            pt,
-                            drag_start_client_x,
-                        );
+                    let target_is_vertical = is_vertical_taskbar(&target_taskbar.rect);
+                    let vertical_offset = if target_is_vertical {
+                        let height = {
+                            let state = lock_state();
+                            state
+                                .as_ref()
+                                .map(vertical_widget_height_for_state)
+                                .unwrap_or(sc(94))
+                        }
+                        .min((target_taskbar.rect.bottom - target_taskbar.rect.top - sc(8)).max(1));
+                        let max_top =
+                            (target_taskbar.rect.bottom - height).max(target_taskbar.rect.top);
+                        Some(
+                            (pt.y - drag_start_client_y).clamp(target_taskbar.rect.top, max_top)
+                                - target_taskbar.rect.top,
+                        )
+                    } else {
+                        None
+                    };
+                    // Dropping a floating widget onto a taskbar docks it there.
+                    if source_placement == Placement::Free || target_index != current_taskbar_index
+                    {
+                        let new_offset = if target_is_vertical {
+                            0
+                        } else {
+                            offset_for_drop_point(
+                                target_taskbar.hwnd,
+                                target_taskbar.rect,
+                                pt,
+                                drag_start_client_x,
+                            )
+                        };
                         {
                             let mut state = lock_state();
                             if let Some(s) = state.as_mut() {
                                 s.tray_offset = new_offset;
+                                s.vertical_offset = vertical_offset;
+                                s.placement = Placement::Taskbar;
+                                s.free_x = FREE_POS_UNSET;
+                                s.free_y = FREE_POS_UNSET;
                             }
                         }
                         if attach_to_taskbar(hwnd, target_index) {
@@ -3766,8 +4377,33 @@ unsafe extern "system" fn wnd_proc(
                             drop(state);
                             position_at_taskbar();
                             render_layered();
+                        } else {
+                            // The taskbar disappeared mid-drop: stay floating
+                            // instead of leaving the widget unplaced.
+                            let (x, y) = (pt.x - drag_start_client_x, pt.y - drag_start_client_y);
+                            enter_free_mode(hwnd, x, y);
                         }
+                    } else if target_is_vertical
+                        && (source_was_free_2d || vertical_offset.is_some())
+                    {
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.vertical_offset = vertical_offset;
+                            }
+                        }
+                        position_at_taskbar();
+                        render_layered();
                     }
+                } else if source_placement == Placement::Free {
+                    // Still floating, just somewhere else: keep it and persist.
+                    position_free();
+                } else {
+                    // Released away from every taskbar: detach and stay put,
+                    // keeping the grab offset so the widget lands under the
+                    // cursor instead of jumping back to its taskbar slot.
+                    let (x, y) = (pt.x - drag_start_client_x, pt.y - drag_start_client_y);
+                    enter_free_mode(hwnd, x, y);
                 }
                 save_state_settings();
             }
@@ -3841,21 +4477,34 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.tray_offset = 0;
+                            s.vertical_offset = None;
                             s.anchor_left = false;
                         }
                     }
+                    leave_free_mode(hwnd);
                     save_state_settings();
-                    position_at_taskbar();
                 }
                 IDM_ANCHOR_LEFT => {
-                    {
+                    let index = {
                         let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            s.anchor_left = !s.anchor_left;
+                        match state.as_mut() {
+                            Some(s) => {
+                                s.anchor_left = !s.anchor_left;
+                                // Anchoring only makes sense on a taskbar.
+                                s.placement = Placement::Taskbar;
+                                s.free_x = FREE_POS_UNSET;
+                                s.free_y = FREE_POS_UNSET;
+                                s.taskbar_index
+                            }
+                            None => return LRESULT(0),
                         }
-                    }
+                    };
                     save_state_settings();
+                    if !attach_to_taskbar(hwnd, index) {
+                        diagnose::log("anchor left: taskbar not available");
+                    }
                     position_at_taskbar();
+                    render_layered();
                 }
                 id if (IDM_MONITOR_FIRST..IDM_MONITOR_FIRST + MAX_MONITOR_MENU_ITEMS as u16)
                     .contains(&id) =>
@@ -3869,6 +4518,11 @@ unsafe extern "system" fn wnd_proc(
                                     s.monitor_device =
                                         native_interop::taskbar_monitor_device(&taskbar);
                                     s.tray_offset = 0;
+                                    s.vertical_offset = None;
+                                    // Picking a monitor explicitly re-docks the widget.
+                                    s.placement = Placement::Taskbar;
+                                    s.free_x = FREE_POS_UNSET;
+                                    s.free_y = FREE_POS_UNSET;
                                 }
                             }
                             save_state_settings();
@@ -3987,7 +4641,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                     save_state_settings();
                     // Font size and weight change the measured widget width.
-                    position_at_taskbar();
+                    reposition_widget();
                     render_layered();
                 }
                 IDM_ALERT_OFF | IDM_ALERT_10 | IDM_ALERT_20 | IDM_ALERT_30 => {
@@ -4053,7 +4707,7 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                     save_state_settings();
-                    position_at_taskbar();
+                    reposition_widget();
                     render_layered();
                     sync_tray_icons(hwnd);
                     let sh = SendHwnd::from_hwnd(hwnd);
@@ -5117,9 +5771,24 @@ mod tests {
 
     #[test]
     fn detects_vertical_taskbars_without_misclassifying_horizontal_ones() {
-        let right = RECT { left: 1900, top: 0, right: 1960, bottom: 1080 };
-        let left = RECT { left: 0, top: 0, right: 72, bottom: 1080 };
-        let bottom = RECT { left: 0, top: 1030, right: 1920, bottom: 1080 };
+        let right = RECT {
+            left: 1900,
+            top: 0,
+            right: 1960,
+            bottom: 1080,
+        };
+        let left = RECT {
+            left: 0,
+            top: 0,
+            right: 72,
+            bottom: 1080,
+        };
+        let bottom = RECT {
+            left: 0,
+            top: 1030,
+            right: 1920,
+            bottom: 1080,
+        };
         assert!(is_vertical_taskbar(&right));
         assert!(is_vertical_taskbar(&left));
         assert!(!is_vertical_taskbar(&bottom));
@@ -5134,7 +5803,12 @@ mod tests {
 
     #[test]
     fn vertical_fallback_stays_outside_right_docked_taskbar() {
-        let taskbar = RECT { left: 2500, top: 0, right: 2560, bottom: 1440 };
+        let taskbar = RECT {
+            left: 2500,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
         // The user's right-side bar begins at x=2500; the widget must end
         // before the bar starts even at non-default DPI.
         let x = adjacent_vertical_x(&taskbar, 55);
@@ -5384,6 +6058,63 @@ mod tests {
         assert_eq!(settings.tray_offset, 321);
         let legacy: SettingsFile = serde_json::from_str("{}").unwrap();
         assert!(!legacy.anchor_left);
+    }
+
+    #[test]
+    fn free_placement_round_trips_and_legacy_settings_stay_docked() {
+        let mut settings = SettingsFile {
+            placement: Placement::Free,
+            free_x: Some(-1200),
+            free_y: Some(240),
+            free_vertical: true,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""placement":"free""#), "{json}");
+        settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(settings.placement, Placement::Free);
+        assert_eq!(settings.free_x, Some(-1200));
+        assert_eq!(settings.free_y, Some(240));
+        assert!(settings.free_vertical);
+
+        // Settings written before floating existed must still dock normally.
+        let legacy: SettingsFile =
+            serde_json::from_str(r#"{"tray_offset":120,"anchor_left":false}"#).unwrap();
+        assert_eq!(legacy.placement, Placement::Taskbar);
+        assert_eq!(legacy.free_x, None);
+        assert_eq!(legacy.free_y, None);
+        assert!(!legacy.free_vertical);
+    }
+
+    #[test]
+    fn floating_position_stays_inside_the_work_area() {
+        // A 1920x1040 work area at the origin, as on a 1080p screen.
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        // Dragged past the right and bottom edges: pulled back in.
+        assert_eq!(clamp_into_rect(work, 5000, 5000, 52, 94), (1868, 946));
+        // Dragged past the top-left: pinned to the corner.
+        assert_eq!(clamp_into_rect(work, -400, -400, 52, 94), (0, 0));
+        // Anywhere in between is preserved exactly.
+        assert_eq!(clamp_into_rect(work, 800, 300, 52, 94), (800, 300));
+
+        // A secondary monitor to the left uses negative coordinates.
+        let left_monitor = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1040,
+        };
+        assert_eq!(
+            clamp_into_rect(left_monitor, -4000, 500, 52, 94),
+            (-1920, 500)
+        );
+        // A widget wider than the work area is pinned, never inverted.
+        assert_eq!(clamp_into_rect(work, 100, 100, 4000, 94), (0, 100));
     }
 
     #[test]
