@@ -100,6 +100,9 @@ struct AppState {
     monitor_device: Option<String>,
     tray_offset: i32,
     anchor_left: bool,
+    // True only if Explorer paints over the attempted in-taskbar popup.
+    // In that case keep the visible quota column just inside the desktop.
+    vertical_outside_taskbar: bool,
     dragging: bool,
     drag_start_mouse_x: i32,
     drag_start_client_x: i32,
@@ -170,6 +173,7 @@ const MAX_MONITOR_MENU_ITEMS: usize = 100;
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
+const TIMER_VERTICAL_VISIBILITY: usize = 7;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
 /// recreates the taskbar and wipes our tray-icon registration).
@@ -892,6 +896,7 @@ fn toggle_widget_visibility(hwnd: HWND) {
             position_at_taskbar();
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             render_layered();
+            unsafe { SetTimer(hwnd, TIMER_VERTICAL_VISIBILITY, 750, None); }
         } else {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
@@ -982,6 +987,10 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         s.win_event_hook = hook;
         s.taskbar_index = index;
         s.embedded = !use_popup;
+        s.vertical_outside_taskbar = false;
+    }
+    if use_popup {
+        unsafe { SetTimer(hwnd, TIMER_VERTICAL_VISIBILITY, 750, None); }
     }
     true
 }
@@ -2110,6 +2119,7 @@ pub fn run() {
                 monitor_device: settings.monitor_device.clone(),
                 tray_offset: settings.tray_offset,
                 anchor_left: settings.anchor_left,
+                vertical_outside_taskbar: false,
                 dragging: false,
                 drag_start_mouse_x: 0,
                 drag_start_client_x: 0,
@@ -2155,6 +2165,9 @@ pub fn run() {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         diagnose::log("window shown");
+        if settings.widget_visible && !embedded {
+            SetTimer(hwnd, TIMER_VERTICAL_VISIBILITY, 750, None);
+        }
 
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
@@ -3126,6 +3139,74 @@ fn tray_reposition_is_suppressed() -> bool {
     }
 }
 
+/// Choose the visible desktop side of a side-docked taskbar, including on
+/// multi-monitor desktops with negative virtual-screen coordinates.
+fn adjacent_vertical_x(taskbar: &RECT, widget_width: i32) -> i32 {
+    let midpoint = POINT {
+        x: taskbar.left + (taskbar.right - taskbar.left) / 2,
+        y: taskbar.top + (taskbar.bottom - taskbar.top) / 2,
+    };
+    let left_docked = unsafe {
+        let monitor = MonitorFromPoint(midpoint, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() {
+            false
+        } else {
+            let mut info = MONITORINFO::default();
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            GetMonitorInfoW(monitor, &mut info).as_bool()
+                && (taskbar.left - info.rcMonitor.left).abs() <= sc(8)
+        }
+    };
+    if left_docked {
+        taskbar.right + sc(5)
+    } else {
+        taskbar.left - widget_width - sc(5)
+    }
+}
+
+/// Native side taskbars can occupy a higher shell surface than our topmost
+/// popup, even though IsWindowVisible is true and WM_PAINT is received.
+/// Check actual hit-testing after ShowWindow; if the shell is above us, move
+/// the quota column to the neighboring desktop edge where it is visible.
+fn ensure_vertical_widget_visible() {
+    let (hwnd, taskbar_hwnd, already_outside, show) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return };
+        (s.hwnd.to_hwnd(), s.taskbar_hwnd, s.vertical_outside_taskbar, s.widget_visible)
+    };
+    if !show || already_outside { return; }
+    let Some(rect) = taskbar_hwnd
+        .and_then(native_interop::get_taskbar_rect)
+        .filter(is_vertical_taskbar) else { return };
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() { return; }
+        let mut actual = RECT::default();
+        if GetWindowRect(hwnd, &mut actual).is_err() { return; }
+        let center = POINT {
+            x: actual.left + (actual.right - actual.left) / 2,
+            y: actual.top + (actual.bottom - actual.top) / 2,
+        };
+        let top_window = WindowFromPoint(center);
+        diagnose::log(format!(
+            "vertical visibility check: self={:?} top={:?} center=({}, {})",
+            hwnd, top_window, center.x, center.y,
+        ));
+        if top_window == hwnd { return; }
+        {
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.vertical_outside_taskbar = true;
+            }
+        }
+        diagnose::log(format!(
+            "taskbar occluded widget: falling back beside taskbar at x={}",
+            adjacent_vertical_x(&rect, actual.right - actual.left),
+        ));
+    }
+    position_at_taskbar();
+    render_layered();
+}
+
 fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
@@ -3188,7 +3269,15 @@ fn position_at_taskbar() {
             taskbar_rect.top + sc(4)
         };
         let y = top.clamp(taskbar_rect.top, (taskbar_rect.bottom - height).max(taskbar_rect.top));
-        let x = taskbar_rect.left + (taskbar_rect.right - taskbar_rect.left - width) / 2;
+        let outside = {
+            let state = lock_state();
+            state.as_ref().is_some_and(|s| s.vertical_outside_taskbar)
+        };
+        let x = if outside && !embedded {
+            adjacent_vertical_x(&taskbar_rect, width)
+        } else {
+            taskbar_rect.left + (taskbar_rect.right - taskbar_rect.left - width) / 2
+        };
         if embedded {
             native_interop::move_window(
                 hwnd, x - taskbar_rect.left, y - taskbar_rect.top, width, height,
@@ -3451,6 +3540,10 @@ unsafe extern "system" fn wnd_proc(
                     update_display();
                     render_layered();
                     schedule_countdown_timer();
+                }
+                TIMER_VERTICAL_VISIBILITY => {
+                    let _ = KillTimer(hwnd, TIMER_VERTICAL_VISIBILITY);
+                    ensure_vertical_widget_visible();
                 }
                 TIMER_TASKBAR_RETRY => {
                     let attachment = {
@@ -5037,6 +5130,15 @@ mod tests {
     fn compact_height_accounts_for_enabled_quota_rows_and_providers() {
         assert!(vertical_content_height(1, 2) > vertical_content_height(1, 1));
         assert!(vertical_content_height(2, 2) > vertical_content_height(1, 2));
+    }
+
+    #[test]
+    fn vertical_fallback_stays_outside_right_docked_taskbar() {
+        let taskbar = RECT { left: 2500, top: 0, right: 2560, bottom: 1440 };
+        // The user's right-side bar begins at x=2500; the widget must end
+        // before the bar starts even at non-default DPI.
+        let x = adjacent_vertical_x(&taskbar, 55);
+        assert!(x + 55 < taskbar.left);
     }
 
     #[test]
