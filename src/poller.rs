@@ -13,6 +13,8 @@ use crate::diagnose;
 use crate::localization::Strings;
 use crate::models::{UsageData, UsageSection};
 use crate::native_interop;
+use windows::core::PCWSTR;
+use windows::Win32::System::Registry::*;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -528,12 +530,141 @@ fn resolve_windows_codex_path() -> String {
     "codex.cmd".to_string()
 }
 
+const INTERNET_SETTINGS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+fn windows_internet_proxy() -> Option<ureq::Proxy> {
+    // ureq's proxy-from-env support reads environment variables, while Windows
+    // desktop proxy settings are commonly stored in Internet Settings instead.
+    // Explicit environment configuration continues to take precedence.
+    let has_environment_proxy = [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some());
+    if has_environment_proxy {
+        return None;
+    }
+
+    let key_path = native_interop::wide_str(INTERNET_SETTINGS_KEY);
+    let mut key = HKEY::default();
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR::from_raw(key_path.as_ptr()),
+            0,
+            KEY_READ,
+            &mut key,
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+
+    let enabled_name = native_interop::wide_str("ProxyEnable");
+    let mut enabled = 0u32;
+    let mut enabled_size = std::mem::size_of::<u32>() as u32;
+    let enabled_result = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR::from_raw(enabled_name.as_ptr()),
+            None,
+            None,
+            Some(&mut enabled as *mut u32 as *mut u8),
+            Some(&mut enabled_size),
+        )
+    };
+
+    let proxy_server = if enabled_result.is_ok() && enabled != 0 {
+        let server_name = native_interop::wide_str("ProxyServer");
+        let mut size = 0u32;
+        let query_size = unsafe {
+            RegQueryValueExW(
+                key,
+                PCWSTR::from_raw(server_name.as_ptr()),
+                None,
+                None,
+                None,
+                Some(&mut size),
+            )
+        };
+        if query_size.is_ok() && size >= 2 {
+            let mut bytes = vec![0u8; size as usize];
+            let query_value = unsafe {
+                RegQueryValueExW(
+                    key,
+                    PCWSTR::from_raw(server_name.as_ptr()),
+                    None,
+                    None,
+                    Some(bytes.as_mut_ptr()),
+                    Some(&mut size),
+                )
+            };
+            if query_value.is_ok() {
+                let wide: Vec<u16> = bytes[..size as usize]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .take_while(|unit| *unit != 0)
+                    .collect();
+                String::from_utf16(&wide).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _ = unsafe { RegCloseKey(key) };
+
+    let proxy = proxy_server.and_then(|value| {
+        let mut fallback = None;
+        let mut https = None;
+        for entry in value
+            .split(';')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            if let Some((scheme, address)) = entry.split_once('=') {
+                let address = address.trim();
+                if address.is_empty() {
+                    continue;
+                }
+                if scheme.trim().eq_ignore_ascii_case("https") {
+                    https = Some(address.to_string());
+                } else if fallback.is_none() {
+                    fallback = Some(address.to_string());
+                }
+            } else if fallback.is_none() {
+                fallback = Some(entry.to_string());
+            }
+        }
+        https.or(fallback)
+    })?;
+    let proxy = if proxy.contains("://") {
+        proxy
+    } else {
+        format!("http://{proxy}")
+    };
+    ureq::Proxy::new(proxy).ok()
+}
+
 fn build_agent() -> Result<ureq::Agent, PollError> {
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
-    Ok(ureq::AgentBuilder::new()
+    let mut builder = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
-        .tls_connector(std::sync::Arc::new(tls))
-        .build())
+        .tls_connector(std::sync::Arc::new(tls));
+    if let Some(proxy) = windows_internet_proxy() {
+        diagnose::log("using Windows Internet Settings proxy for API requests");
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder.build())
 }
 
 fn classify_http_status(status: u16) -> PollError {
